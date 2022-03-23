@@ -1,14 +1,16 @@
 import * as THREE from 'three';
 import metaversefile from 'metaversefile';
-const {useApp, useFrame, useActivate, useLocalPlayer, useVoices, useChatManager, useLoreAI, useLoreAIScene, useAvatarAnimations, useNpcManager, useScene, usePhysics, useCleanup} = metaversefile;
+const {useApp, useFrame, useActivate, useLocalPlayer, useVoices, useChatManager, useLoreAI, useLoreAIScene, useAvatarAnimations, useNpcManager, useScene, usePhysics, useCleanup, usePathFinder} = metaversefile;
 
 // const baseUrl = import.meta.url.replace(/(\/)[^\/\\]*$/, '$1');
+const npcPlayerHeight = 1.518240094787793; // todo: no hardcode.
 
 const localVector = new THREE.Vector3();
-// const localVector2 = new THREE.Vector3();
+const localVector2 = new THREE.Vector3();
 // const localVector3 = new THREE.Vector3();
 // const localQuaternion = new THREE.Quaternion();
 // const localMatrix = new THREE.Matrix4();
+const localEuler = new THREE.Euler();
 
 export default e => {
   const app = useApp();
@@ -27,10 +29,29 @@ export default e => {
   const npcVoiceName = app.getComponent('voice') ?? 'Sweetie Belle';
   const npcBio = app.getComponent('bio') ?? 'A generic avatar.';
   const npcAvatarUrl = app.getComponent('avatarUrl') ?? `/avatars/drake_hacker_v3_vian.vrm`;
+  // const npcAvatarUrl = app.getComponent('avatarUrl') ?? `/avatars/citrine.vrm`;
   let npcWear = app.getComponent('wear') ?? [];
   if (!Array.isArray(npcWear)) {
     npcWear = [npcWear];
   }
+
+  const voxelHeight = 1.65;
+  const voxelHeightHalf = voxelHeight / 2;
+  const PathFinder = usePathFinder();
+  const pathFinder = new PathFinder({voxelHeight: voxelHeight, heightTolerance: 0.5, maxIterdetect: 1000, maxIterStep: 30, ignorePhysicsIds: [], debugRender: false});
+  /* args:
+    voxelHeight: Voxel height ( Y axis ) for collide detection, usually equal to npc's physical capsule height. X/Z axes sizes are hard-coded 1 now.
+    heightTolerance: Used to check whether currentVoxel can go above to neighbor voxels.
+    maxIterDetect: How many steps can one voxel detecing iterate. Currently only `destVoxel` need this arg.
+    maxIterStep: How many A* path-finding step can one getPath() iterate. One A* step can create up to 4 voxels, 0 ~ 4.
+    ignorePhysicsIds: physicsIds that voxel detect() ignored, usually npc CharacterController's capsule.
+    debugRender: Whether show voxel boxes for debugging.
+  */
+  window.pathFinder = pathFinder; // test
+  let waypointResult = null;
+  let lastWaypointResult = null;
+  let lastDest = null;
+  let lastGetPathTime = 0;
 
   let live = true;
   let vrmApp = null;
@@ -39,24 +60,23 @@ export default e => {
     const u2 = npcAvatarUrl;
     const m = await metaversefile.import(u2);
     if (!live) return;
-    
     vrmApp = metaversefile.createApp({
       name: u2,
     });
 
-    vrmApp.matrixWorld.copy(app.matrixWorld);
-    vrmApp.matrix.copy(app.matrixWorld)
-      .decompose(vrmApp.position, vrmApp.quaternion, vrmApp.scale);
+    vrmApp.position.copy(app.position);
+    vrmApp.quaternion.copy(app.quaternion);
+    vrmApp.scale.copy(app.scale);
+    vrmApp.updateMatrixWorld();
     vrmApp.name = 'npc';
     vrmApp.setComponent('physics', true);
     vrmApp.setComponent('activate', true);
-
     await vrmApp.addModule(m);
     if (!live) return;
 
-    const position = vrmApp.position.clone()
+    const position = app.position.clone()
       .add(new THREE.Vector3(0, 1, 0));
-    const {quaternion, scale} = vrmApp;
+    const {quaternion, scale} = app;
     const newNpcPlayer = await npcManager.createNpc({
       name: npcName,
       avatarApp: vrmApp,
@@ -66,13 +86,11 @@ export default e => {
     });
     if (!live) return;
 
-    // console.log('got position', position.toArray(), quaternion.toArray(), scale.toArray());
-
-    /* const _setTransform = () => {
+    const _setTransform = () => {
       newNpcPlayer.position.y = newNpcPlayer.avatar.height;
       newNpcPlayer.updateMatrixWorld();
     };
-    _setTransform(); */
+    _setTransform();
 
     const _updateWearables = async () => {
       const wearablePromises = npcWear.map(wear => (async () => {
@@ -102,6 +120,8 @@ export default e => {
     scene.add(vrmApp);
     
     npcPlayer = newNpcPlayer;
+    window.npcPlayer = npcPlayer;
+    pathFinder.setIgnorePhysicsIds([npcPlayer.characterController.physicsId]);
   })());
 
   app.getPhysicsObjects = () => npcPlayer ? [npcPlayer.characterController] : [];
@@ -125,10 +145,10 @@ export default e => {
   let targetSpec = null;
   useActivate(() => {
     // console.log('activate npc');
-    if (targetSpec?.object !== localPlayer) {
+    if (!targetSpec) {
       targetSpec = {
         type: 'follow',
-        object: localPlayer,
+        object: npcPlayer, // Object3D
       };
     } else {
       targetSpec = null;
@@ -148,7 +168,7 @@ export default e => {
   });
   // console.log('got character', character);
   character.addEventListener('say', e => {
-    console.log('got character say', e.data);
+    // console.log('got character say', e.data);
     const {message, emote, action, object, target} = e.data;
     chatManager.addPlayerMessage(npcPlayer, message);
     if (emote === 'supersaiyan' || action === 'supersaiyan' || /supersaiyan/i.test(object) || /supersaiyan/i.test(target)) {
@@ -159,46 +179,71 @@ export default e => {
     } else if (action === 'follow' || (object === 'none' && target === localPlayer.name)) { // follow player
       targetSpec = {
         type: 'follow',
-        object: localPlayer,
+        object: npcPlayer,
       };
     } else if (action === 'stop') { // stop
       targetSpec = null;
     } else if (action === 'moveto' || (object !== 'none' && target === 'none')) { // move to object
-      console.log('move to object', object);
+      // console.log('move to object', object);
       /* target = localPlayer;
       targetType = 'follow'; */
     } else if (action === 'moveto' || (object === 'none' && target !== 'none')) { // move to player
       // console.log('move to', object);
       targetSpec = {
         type: 'moveto',
-        object: localPlayer,
+        object: npcPlayer,
       };
     } else if (['pickup', 'grab', 'take', 'get'].includes(action)) { // pick up object
-      console.log('pickup', action, object, target);
+      // console.log('pickup', action, object, target);
     } else if (['use', 'activate'].includes(action)) { // use object
-      console.log('use', action, object, target);
+      // console.log('use', action, object, target);
     }
   });
 
   const slowdownFactor = 0.4;
   const walkSpeed = 0.075 * slowdownFactor;
-  const runSpeed = walkSpeed * 8;
+  const runSpeed = walkSpeed * 5;
   const speedDistanceRate = 0.07;
   useFrame(({timestamp, timeDiff}) => {
     if (npcPlayer && physics.getPhysicsEnabled()) {
       if (targetSpec) {
-        const target = targetSpec.object;
-        const v = localVector.setFromMatrixPosition(target.matrixWorld)
+        // console.log('npcFarawayLocalPlayer')
+        if (performance.now() - lastGetPathTime > 500) {
+          // console.log('localPlayerFarawayLastDest')
+          lastGetPathTime = performance.now(); // Limit the execution of `getPath()` at most once per second, to prevent `getPath()` from being executed every frame when localPlayer exceeds the detection range of `maxIterStep`, resulting in serious performance degradation.
+          console.time('getPath')
+          waypointResult = pathFinder.getPath(npcPlayer.position, getRandomAwayDest());
+          console.timeEnd('getPath')
+          if (waypointResult) {
+            targetSpec.object = waypointResult[0];
+            lastWaypointResult = waypointResult;
+            lastDest = lastWaypointResult[lastWaypointResult.length - 1];
+            // console.log(lastDest)
+          }
+        }
+
+        if (npcReachedTarget()) {
+          // console.log('npcReachedTarget')
+          if (targetSpec.object._next) {
+            targetSpec.object = targetSpec.object._next;
+          }
+        }
+
+        // if (pathFinder.debugRender) console.log(targetSpec.object.position.x, targetSpec.object.position.z);
+        const v = localVector.copy(targetSpec.object.position)
           .sub(npcPlayer.position);
         v.y = 0;
         const distance = v.length();
         if (targetSpec.type === 'moveto' && distance < 2) {
           targetSpec = null;
         } else {
-          const speed = Math.min(Math.max(walkSpeed + ((distance - 1.5) * speedDistanceRate), 0), runSpeed);
-          v.normalize()
-            .multiplyScalar(speed * timeDiff);
-          npcPlayer.characterPhysics.applyWasd(v);
+          if (!npcReachedDest()) { // Fix npc jetter after reached dest problem.
+            // const speed = Math.min(Math.max(walkSpeed + ((distance - 1.5) * speedDistanceRate), 0), runSpeed);
+            const speed = Math.min(Math.max(walkSpeed + ((distance) * speedDistanceRate), 0), runSpeed);
+            v.normalize()
+              .multiplyScalar(speed * timeDiff);
+            npcPlayer.characterPhysics.applyWasd(v);
+          }
         }
       }
 
@@ -221,6 +266,29 @@ export default e => {
 
     loreAIScene.removeCharacter(character);
   });
+
+  function localPlayerFarawayLastDest() {
+    if (!lastDest) return true;
+    return Math.abs(localPlayer.position.x - lastDest.position.x) > 3 || Math.abs(localPlayer.position.z - lastDest.position.z) > 3;
+  }
+  function npcFarawayLocalPlayer() {
+    return localVector.subVectors(localPlayer.position, npcPlayer.position).length() > 3;
+  }
+  function npcReachedTarget() {
+    return Math.abs(npcPlayer.position.x - targetSpec.object.position.x) < .5 && Math.abs(npcPlayer.position.y - targetSpec.object.position.y) < npcPlayerHeight && Math.abs(npcPlayer.position.z - targetSpec.object.position.z) < .5;
+  }
+  function npcReachedDest() {
+    if (!lastWaypointResult) return false;
+    const destResult = lastWaypointResult[lastWaypointResult.length - 1];
+    return Math.abs(npcPlayer.position.x - destResult.position.x) < 0.5 && Math.abs(npcPlayer.position.y - destResult.position.y) < npcPlayerHeight && Math.abs(npcPlayer.position.z - destResult.position.z) < 0.5
+  }
+  function getRandomAwayDest() {
+    localVector2.subVectors(npcPlayer.position, localPlayer.position);
+    localVector2.normalize().multiplyScalar(Math.random() * 10 + 10);
+    localVector2.applyEuler(localEuler.set(0, (Math.random() - 0.5) * Math.PI, 0));
+    localVector2.add(localPlayer.position);
+    return localVector2;
+  }
 
   return app;
 };
